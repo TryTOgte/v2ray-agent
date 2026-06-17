@@ -271,6 +271,8 @@ initVar() {
 
     # ssl类型
     sslType=
+    # TLS安装方式 acme/custom
+    tlsInstallMethod=
     # SSL CF API Token
     cfAPIToken=
 
@@ -1766,6 +1768,249 @@ customSSLEmail() {
     fi
 
 }
+
+# 是否为自定义证书
+isCustomCert() {
+    if [[ -f "/etc/v2ray-agent/tls/cert_source" ]]; then
+        local certSource
+        certSource=$(cat /etc/v2ray-agent/tls/cert_source)
+        if [[ "${certSource}" == "custom" || "${certSource}" == "cloudflare_origin" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 粘贴 PEM 内容到文件
+readCustomPEM() {
+    local outputFile=$1
+    local prompt=$2
+    echoContent yellow "${prompt}"
+    echoContent yellow "粘贴完成后，在新行输入 END_OF_CERT 并回车"
+    : >"${outputFile}"
+    while IFS= read -r line; do
+        if [[ "${line}" == "END_OF_CERT" ]]; then
+            break
+        fi
+        echo "${line}" >>"${outputFile}"
+    done
+}
+
+# 验证自定义证书与私钥是否匹配
+validateCustomCert() {
+    local certPath=$1
+    local keyPath=$2
+
+    if [[ ! -s "${certPath}" || ! -s "${keyPath}" ]]; then
+        echoContent red " ---> 证书或私钥文件为空"
+        return 1
+    fi
+
+    if ! openssl x509 -in "${certPath}" -noout 2>/dev/null; then
+        echoContent red " ---> 证书格式无效，请确认是 PEM 格式"
+        return 1
+    fi
+
+    if ! openssl rsa -in "${keyPath}" -check -noout 2>/dev/null && ! openssl ec -in "${keyPath}" -check -noout 2>/dev/null && ! openssl pkey -in "${keyPath}" -noout 2>/dev/null; then
+        echoContent red " ---> 私钥格式无效，请确认是 PEM 格式"
+        return 1
+    fi
+
+    local certMd5 keyMd5
+    certMd5=$(openssl x509 -noout -modulus -in "${certPath}" 2>/dev/null | openssl md5 2>/dev/null)
+    keyMd5=$(openssl rsa -noout -modulus -in "${keyPath}" 2>/dev/null | openssl md5 2>/dev/null)
+    if [[ -z "${keyMd5}" ]]; then
+        keyMd5=$(openssl ec -noout -pubout -in "${keyPath}" 2>/dev/null | openssl md5 2>/dev/null)
+        certMd5=$(openssl x509 -pubkey -noout -in "${certPath}" 2>/dev/null | openssl md5 2>/dev/null)
+    fi
+
+    if [[ -z "${certMd5}" || -z "${keyMd5}" || "${certMd5}" != "${keyMd5}" ]]; then
+        echoContent red " ---> 证书与私钥不匹配"
+        return 1
+    fi
+
+    return 0
+}
+
+# 显示自定义证书信息
+showCustomCertInfo() {
+    local certPath=$1
+    local certSource=$2
+
+    if [[ ! -f "${certPath}" ]]; then
+        return 1
+    fi
+
+    local notAfter subject issuer
+    notAfter=$(openssl x509 -enddate -noout -in "${certPath}" 2>/dev/null | cut -d= -f2)
+    subject=$(openssl x509 -subject -noout -in "${certPath}" 2>/dev/null | sed 's/subject=//')
+    issuer=$(openssl x509 -issuer -noout -in "${certPath}" 2>/dev/null | sed 's/issuer=//')
+
+    echoContent skyBlue " ---> 证书类型:${certSource}"
+    echoContent skyBlue " ---> 证书主题:${subject}"
+    echoContent skyBlue " ---> 证书颁发者:${issuer}"
+    echoContent skyBlue " ---> 证书到期时间:${notAfter}"
+
+    if [[ "${certSource}" == "cloudflare_origin" ]]; then
+        echoContent yellow " ---> Cloudflare Origin CA 证书需在 Cloudflare 控制台手动续期"
+        echoContent yellow " ---> 路径: SSL/TLS -> Origin Server -> Create Certificate"
+    else
+        echoContent yellow " ---> 自定义证书无法自动续期，请在到期前手动更新"
+    fi
+}
+
+# 选择 TLS 安装方式
+selectTLSInstallMethod() {
+    echoContent red "\n=============================================================="
+    echoContent yellow "1.acme 自动申请[默认，Let's Encrypt/ZeroSSL/BuyPass]"
+    echoContent yellow "2.导入自定义证书[Cloudflare Origin CA/其他]"
+    echoContent red "=============================================================="
+    read -r -p "请选择[回车]使用默认:" selectTLSMethod
+    case ${selectTLSMethod} in
+    2)
+        tlsInstallMethod="custom"
+        ;;
+    *)
+        tlsInstallMethod="acme"
+        ;;
+    esac
+}
+
+# 导入自定义证书
+installCustomTLS() {
+    local tlsDomain=${domain}
+    local certSource="custom"
+    local certFile="/tmp/v2ray-agent-custom-${tlsDomain}.crt"
+    local keyFile="/tmp/v2ray-agent-custom-${tlsDomain}.key"
+
+    if [[ -z "${tlsDomain}" ]]; then
+        read -r -p "请输入证书对应域名:" tlsDomain
+        if [[ -z "${tlsDomain}" ]]; then
+            echoContent red " ---> 域名不能为空"
+            exit 0
+        fi
+        domain=${tlsDomain}
+    fi
+
+    mkdir -p /etc/v2ray-agent/tls
+
+    echoContent red "\n=============================================================="
+    echoContent yellow "1.Cloudflare Origin CA 证书[推荐，适合开启 CF 代理的域名]"
+    echoContent yellow "2.其他自定义证书"
+    echoContent red "=============================================================="
+    read -r -p "请选择[回车]默认 Cloudflare:" selectCustomCertType
+    case ${selectCustomCertType} in
+    2)
+        certSource="custom"
+        ;;
+    *)
+        certSource="cloudflare_origin"
+        echoContent yellow "\n请先在 Cloudflare 控制台创建 Origin Certificate:"
+        echoContent yellow "SSL/TLS -> Origin Server -> Create Certificate"
+        echoContent yellow "有效期最长 15 年，域名需开启 Cloudflare 代理(橙色云朵)\n"
+        ;;
+    esac
+
+    echoContent red "\n=============================================================="
+    echoContent yellow "1.输入证书/私钥文件路径"
+    echoContent yellow "2.粘贴 PEM 内容"
+    echoContent red "=============================================================="
+    read -r -p "请选择[回车]默认路径:" importMethod
+
+    rm -f "${certFile}" "${keyFile}"
+
+    if [[ "${importMethod}" == "2" ]]; then
+        readCustomPEM "${certFile}" "请粘贴证书内容(包含 BEGIN/END):"
+        readCustomPEM "${keyFile}" "请粘贴私钥内容(包含 BEGIN/END):"
+    else
+        local certPath keyPath
+        read -r -p "请输入证书文件路径:" certPath
+        read -r -p "请输入私钥文件路径:" keyPath
+        if [[ ! -f "${certPath}" || ! -f "${keyPath}" ]]; then
+            echoContent red " ---> 证书或私钥文件不存在"
+            exit 0
+        fi
+        cp "${certPath}" "${certFile}"
+        cp "${keyPath}" "${keyFile}"
+    fi
+
+    if [[ "${certSource}" == "cloudflare_origin" ]]; then
+        read -r -p "是否追加 Cloudflare Origin CA 根证书构成完整证书链？[y/n]:" appendCA
+        if [[ "${appendCA}" == "y" ]]; then
+            curl -fsSL "https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem" >>"${certFile}" 2>/dev/null
+            if ! grep -q "BEGIN CERTIFICATE" "${certFile}"; then
+                echoContent red " ---> 追加 Cloudflare 根证书失败，请检查网络"
+                exit 0
+            fi
+            echoContent green " ---> 已追加 Cloudflare Origin CA 根证书"
+        fi
+    fi
+
+    if ! validateCustomCert "${certFile}" "${keyFile}"; then
+        rm -f "${certFile}" "${keyFile}"
+        exit 0
+    fi
+
+    cp "${certFile}" "/etc/v2ray-agent/tls/${tlsDomain}.crt"
+    cp "${keyFile}" "/etc/v2ray-agent/tls/${tlsDomain}.key"
+    chmod 600 "/etc/v2ray-agent/tls/${tlsDomain}.key"
+    echo "${certSource}" >/etc/v2ray-agent/tls/cert_source
+    rm -f "${certFile}" "${keyFile}"
+
+    showCustomCertInfo "/etc/v2ray-agent/tls/${tlsDomain}.crt" "${certSource}"
+    echoContent green " ---> 自定义证书安装成功"
+}
+
+# 证书管理菜单
+manageTLSMenu() {
+    if [[ -n $1 ]]; then
+        echoContent skyBlue "\n进度  $1/1 : 证书管理"
+    else
+        echoContent skyBlue "\n功能 1/1 : 证书管理"
+    fi
+
+    echoContent red "\n=============================================================="
+    echoContent yellow "1.检查/更新证书"
+    echoContent yellow "2.导入自定义证书[Cloudflare Origin CA/其他]"
+    echoContent yellow "3.切换为 acme 自动申请"
+    echoContent red "=============================================================="
+    read -r -p "请输入:" manageTLSStatus
+    case ${manageTLSStatus} in
+    1)
+        renewalTLS
+        ;;
+    2)
+        readAcmeTLS
+        if [[ -n "${currentHost}" ]]; then
+            domain=${currentHost}
+        fi
+        installCustomTLS
+        reloadCore
+        handleNginx stop
+        handleNginx start
+        ;;
+    3)
+        read -r -p "切换后将删除当前证书并重新走 acme 申请，是否继续？[y/n]:" switchAcmeStatus
+        if [[ "${switchAcmeStatus}" == "y" ]]; then
+            if [[ -n "${currentHost}" ]]; then
+                domain=${currentHost}
+            fi
+            rm -f /etc/v2ray-agent/tls/cert_source
+            rm -f "/etc/v2ray-agent/tls/${currentHost}.crt" "/etc/v2ray-agent/tls/${currentHost}.key"
+            tlsInstallMethod="acme"
+            installTLS
+            reloadCore
+            handleNginx stop
+            handleNginx start
+            installCronTLS
+        fi
+        ;;
+    *)
+        echoContent red " ---> 选择错误"
+        ;;
+    esac
+}
+
 # DNS API申请证书
 switchDNSAPI() {
     read -r -p "是否使用DNS API申请证书[支持NAT]？[y/n]:" dnsAPIStatus
@@ -1993,6 +2238,14 @@ installTLS() {
         fi
 
     elif [[ -d "$HOME/.acme.sh" ]] && [[ ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.cer" || ! -f "$HOME/.acme.sh/${tlsDomain}_ecc/${tlsDomain}.key" ]]; then
+        if [[ -z "${tlsInstallMethod}" ]]; then
+            selectTLSInstallMethod
+        fi
+        if [[ "${tlsInstallMethod}" == "custom" ]]; then
+            installCustomTLS
+            return
+        fi
+
         switchDNSAPI
         if [[ -z "${dnsAPIType}" ]]; then
             echoContent yellow "\n ---> 不采用API申请证书"
@@ -2208,7 +2461,7 @@ handleNginx() {
 
 # 定时任务更新tls证书
 installCronTLS() {
-    if [[ -z "${btDomain}" ]]; then
+    if [[ -z "${btDomain}" ]] && ! isCustomCert; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加定时维护证书"
         crontab -l >/etc/v2ray-agent/backup_crontab.cron
         local historyCrontab
@@ -2294,8 +2547,14 @@ renewalTLS() {
         else
             echoContent green " ---> 证书有效"
         fi
-    elif [[ -f "/etc/v2ray-agent/tls/${tlsDomain}.crt" && -f "/etc/v2ray-agent/tls/${tlsDomain}.key" && -n $(cat "/etc/v2ray-agent/tls/${tlsDomain}.crt") ]]; then
-        echoContent yellow " ---> 检测到使用自定义证书，无法执行renew操作。"
+    elif [[ -f "/etc/v2ray-agent/tls/${domain}.crt" && -f "/etc/v2ray-agent/tls/${domain}.key" && -n $(cat "/etc/v2ray-agent/tls/${domain}.crt") ]]; then
+        local certSource="custom"
+        if [[ -f "/etc/v2ray-agent/tls/cert_source" ]]; then
+            certSource=$(cat /etc/v2ray-agent/tls/cert_source)
+        fi
+        echoContent skyBlue " ---> 证书检查日期:$(date "+%F %H:%M:%S")"
+        showCustomCertInfo "/etc/v2ray-agent/tls/${domain}.crt" "${certSource}"
+        echoContent yellow " ---> 自定义证书无法自动 renew，请通过菜单【证书管理 -> 导入自定义证书】手动更新"
     else
         echoContent red " ---> 未安装"
     fi
@@ -10061,7 +10320,7 @@ menu() {
         updateNginxBlog 1
         ;;
     9)
-        renewalTLS 1
+        manageTLSMenu 1
         ;;
     10)
         manageCDN 1
